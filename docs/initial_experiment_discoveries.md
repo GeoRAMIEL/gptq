@@ -12,8 +12,15 @@ comparable machine.
 - It **reproduces the paper's perplexity numbers** for OPT-125M / 1.3B / 6.7B within calibration noise.
 - **VRAM is not the bottleneck**: the code keeps the model on the CPU and moves one transformer block at a
   time onto the GPU. OPT-6.7B GPTQ peaked at 9.2 GiB.
-- The repo's 3-bit inference kernels were tuned for OPT-175B on A100s and are **slower than FP16 on small
-  models** (OPT-125M). That is the most obvious opening for a CUDA project.
+- The repo's 3-bit inference kernels were tuned for OPT-175B on A100s, and end-to-end token generation with
+  them is **slower than FP16 on small models** (OPT-125M). That is the most obvious opening for a CUDA project.
+- **4-bit results are simulated quantization**: the quantized values are written back as FP16 weights, so
+  they show the accuracy effect but give no memory or speed benefit. Only 3-bit has a packed format and
+  kernel, and `opt.py --wbits 4 --save` **silently corrupts the checkpoint** (it always packs as 3-bit).
+- **Quantization time profile** (`tools/profile_quant_time.py`): at OPT-6.7B, half the time is Hessian
+  accumulation (FP32 GEMMs) and 23% is the column loop in `fasterquant`. The column loop costs about 78 µs per
+  column at every model size, so it is limited by Python and kernel-launch overhead, which makes it a good
+  candidate for a fused kernel.
 
 ## Test machine
 
@@ -100,6 +107,10 @@ WikiText2 test set. Paper values are from Table 3.
 | OPT-1.3B | GPTQ 4-bit | 15.67 | 15.47 | 18.27 | 15.55 | 95 s | 4.6 GiB |
 | OPT-6.7B | GPTQ 4-bit | 11.34 | 11.39 | 13.75 | 12.14 | 403 s | 9.2 GiB |
 
+All perplexities here are from simulated quantization: after GPTQ, each weight is replaced by its
+quantized value but stored and multiplied in FP16 (as in the paper's accuracy experiments). Real low-bit
+storage exists only for 3-bit, through `--save` (see "Limitations of the quantized inference path" below).
+
 Llama-architecture check with `llama.py` (after the RoPE fix), on
 `HuggingFaceTB/SmolLM2-135M`, calibrated on WikiText2:
 
@@ -113,9 +124,40 @@ Llama-architecture check with `llama.py` (after the RoPE fix), on
 
 ### Where the quantization time goes
 
-For OPT-1.3B, only 46 s of the 95 s is spent inside `GPTQ.fasterquant` (the column-by-column solver).
-For OPT-6.7B it is 155 of 403 s. The rest is the calibration forward passes over 128 × 2048 tokens and the
-Hessian accumulation (`H += X Xᵀ`), both done one sample at a time.
+Measured with `tools/profile_quant_time.py` (4-bit, 128 × 2048 calibration tokens from WikiText2). The tool
+runs an instrumented copy of `GPTQ.fasterquant` with timers between stages; its per-layer `error` values match
+an unmodified `opt.py` run exactly. OPT-125M uses all 12 layers; OPT-1.3B and 6.7B use the first 2 layers
+(all layers in a model have the same shape), and their extrapolated full-model times (98 s, 404 s) match the
+full runs above (95 s, 403 s).
+
+| Share of per-layer time | OPT-125M | OPT-1.3B | OPT-6.7B |
+|---|---|---|---|
+| `fasterquant` column loop (inside 128-column blocks) | **53.2%** | 35.5% | 22.9% |
+| `add_batch`: Hessian accumulation `H += X Xᵀ` | 26.8% | 40.5% | **49.5%** |
+| Remainder: layer forward passes (2 per sample) + CPU↔GPU moves | 16.8% | 18.9% | 20.4% |
+| `fasterquant` Cholesky → inverse → Cholesky | 2.2% | 3.4% | 5.4% |
+| `fasterquant` block update `W[:, i2:] -= Err1 @ Hinv` | 0.2% | 0.5% | 1.4% |
+| `fasterquant` setup + write back | 0.9% | 1.1% | 0.4% |
+| Per-layer time | 1.03 s | 4.1 s | 12.6 s |
+
+What this means:
+
+- **The column loop is overhead-bound.** It costs 79.5, 78.4 and 78.4 µs per column on the three models,
+  even though the number of rows grows from 768 to 4096. Each column runs about 15–20 tiny PyTorch ops
+  (quantize, loss, error, rank-1 update), so the time goes to Python and kernel launches, not to the GPU's
+  arithmetic. Fusing a whole 128-column block into one CUDA kernel (one thread or warp per group of rows,
+  with the block's `Hinv` in shared memory) should remove most of it. This matters most for small models,
+  where it is over half the time.
+- **Hessian accumulation is compute-bound and dominates for larger models.** For OPT-6.7B each layer computes
+  about 185 TFLOP: six Hessians per sample, with `fc2`'s 16384 × 16384 one being 76% of that, × 128
+  samples. That takes 6.25 s per layer, about 30 TFLOPS, close to this GPU's FP32 peak (about 44 TFLOPS;
+  `gptq.py` disables TF32). Possible improvements: q/k/v_proj share the same input but each builds its own
+  Hessian (deduplicating saves 9.5% of the FLOPs); `X Xᵀ` is symmetric, so a SYRK-style update needs only
+  half the work; and tensor-core TF32/FP16 accumulation is possible if accuracy holds. The CSIL RTX 2000 Ada
+  has only about 12 TFLOPS FP32, so this share will be larger there.
+- **Limit on speedup:** even an infinitely fast column loop would save at most 23% at 6.7B (53% at 125M).
+  A Track A plan should target both the column loop and the Hessian accumulation, and possibly batch the
+  forward passes, which run one sample at a time.
 
 ### Inference speed with the 3-bit kernel
 
@@ -131,9 +173,32 @@ Hessian accumulation (`H += X Xᵀ`), both done one sample at a time.
 | same, 3-bit kernel | 0.29 ms (**5.2× faster**) |
 
 The kernel is correct (`test_kernel.py` output matches the simulated-quantization result) and gives large
-speedups on huge matrices, but it **loses to FP16 at OPT-125M's 768/3072-wide layers**. At that size,
-kernel launch overhead, `atomicAdd` reduction, the fixed 24×256 tiling and Python per-layer overhead
-dominate, not memory bandwidth.
+speedups on huge matrices, but end-to-end generation **loses to FP16 at OPT-125M's 768/3072-wide layers**.
+Likely causes are kernel launch overhead, `atomicAdd` reduction, the fixed 24×256 tiling and Python per-layer
+overhead rather than memory bandwidth, but this is **not yet verified**. The repo's benchmark times each
+token with `time.time()` around the whole forward pass, so it can't separate kernel time from overhead.
+Before choosing kernel optimizations, time the kernels with CUDA events (after warm-up) and profile with
+Nsight Systems / Nsight Compute.
+
+### Limitations of the quantized inference path
+
+- **Only 3-bit has a packed format and kernel** (`Quant3Linear`, `quant_cuda`). Every other bit width is
+  simulated in FP16.
+- **`opt.py --wbits 4 --save` silently produces a corrupted checkpoint.** `opt_pack3` is called regardless
+  of `--wbits`, and 4-bit values (0–15) overflow the 3-bit fields. Tested on OPT-125M: the 3-bit checkpoint
+  loads and scores PPL 76.2 on the 128-token `--benchmark --check` sample; the 4-bit one loads with no error
+  and scores **13,349**. `llama.py` and `bloom.py` call their 3-bit packers the same way, regardless of
+`--wbits` (seen in the code, not run).
+- **No group support:** the kernel has one scale/zero per output column, so models quantized with
+  `--groupsize` cannot use it.
+- **Single token only:** `Quant3Linear.forward` raises an error for anything but one token (batch 1, one
+  position), so prompts are processed token by token and batch > 1 is impossible.
+- **Fixed shapes:** input size must be a multiple of 32 for packing, and the kernel's 24-row × 256-column
+  tiling assumes shapes like OPT's; there are no bounds checks.
+- **Bit packing runs on the CPU** (`Quant3Linear.pack`, NumPy, with a `# TODO: perform packing on GPU` in
+  `opt.py`). Measured at OPT-6.7B shapes: 0.05 s per 4096×4096 layer, 0.18 s for `fc1`/`fc2`, about 0.6 s per
+  decoder layer, **about 18 s for the whole model**. That's about 4% of quantization time and is paid once,
+  so GPU packing is a minor optimization.
 
 ### Memory limits: context length and calibration size (OPT-6.7B)
 
@@ -143,8 +208,8 @@ Full details are in [`context_length_findings.md`](context_length_findings.md). 
   fits: FP16 OPT-6.7B fully on the GPU, batch 1, 2048-token prompt peaks at 13.6 of 15.44 GiB usable.
 - **Whole model on the GPU (inference):** weights take 12.40 GiB and the KV cache 0.5 MiB/token, which leaves
   room for about 3,600–3,700 cached tokens in total (batch 2 → 1856 tokens each, batch 4 → 896, batch 8 → 448).
-  4-bit weights would free about 9 GiB for the KV cache (estimated; the repo's kernel can't be tested beyond
-  batch 1).
+  Truly packed 4-bit weights would free about 9 GiB for the KV cache. That is an arithmetic estimate: the
+  repo's 4-bit is simulated in FP16 (no memory saving), and its 3-bit kernel only runs batch 1.
 - **GPTQ pipeline:** peak ≈ 5.16 GiB + nsamples/32 GiB, so the maximum is about **288 calibration segments**
   (590k tokens, 2.25× the paper's 128). It runs out of memory at 304. The peak always occurs while quantizing
   `fc2`: its 1 GiB FP32 Hessian goes through Cholesky → inverse → Cholesky (about 3.75 GiB of temporaries).
@@ -156,6 +221,7 @@ Full details are in [`context_length_findings.md`](context_length_findings.md). 
 | `tools/fp16_context_memory.py` | FP16 full-GPU peak VRAM vs prompt length and batch size; longest prompt that fits per batch size |
 | `tools/calib_memory_sweep.py N` | GPTQ pipeline peak VRAM and time per layer for N calibration segments (first 2 layers) |
 | `tools/gptq_memory_phases.py N` | Per-phase VRAM breakdown of quantizing one layer |
+| `tools/profile_quant_time.py MODEL [--layers N]` | Wall-time breakdown of quantization (Hessian, column loop, Cholesky, forward passes) |
 
 ## Conclusions
 
@@ -165,19 +231,49 @@ Full details are in [`context_length_findings.md`](context_length_findings.md). 
    (about 1 minute end to end), OPT-1.3B / 2.7B for headline results.
 2. **Low setup cost.** The environment and porting work is done. The team can start from a baseline that
    matches the paper.
-3. **Clear CUDA project targets for a "scaled-down" setting:**
-   - Quantized matvec/GEMM kernels tuned for small/mid-size layers and the Ada architecture (the current
-     ones lose to FP16 there). Options include 4-bit kernels (the repo only has 3-bit), better tiling,
-     avoiding `atomicAdd`, and vectorized loads.
-   - The quantization pipeline itself: batched calibration forward passes, faster Hessian accumulation, and a
-     custom kernel for the blocked column-update loop in `fasterquant`, which runs one column at a time from
-     Python.
-   - Fusing dequantization into the surrounding ops, and CUDA Graphs to remove per-token launch overhead
-     in generation.
+3. **Running the repo is not a project by itself.** It already covers most of the professor's wording
+   (GPTQ, small models, low-bit evaluation, a CUDA kernel), so the proposal needs CUDA work of our own,
+   measured against the repo as a baseline.
+4. **Clear CUDA project targets for a "scaled-down" setting**, in two tracks:
+   - **Track A, the quantization algorithm** (most directly "implementing GPTQ"): a fused kernel for the
+     128-column block loop in `fasterquant` (overhead-bound at about 78 µs/column; 23–53% of time), and a
+     faster Hessian accumulation (compute-bound; up to 50% of time). Options there: dedupe q/k/v, symmetric
+     SYRK-style update, tensor cores. Keep cuSOLVER for the Cholesky steps (2–5%). Batching the per-sample
+     forward passes (about 20%) is a further option.
+   - **Track B, low-bit inference:** a real packed INT4 format and INT4 × FP16 matvec kernel (the repo has none,
+     and its 4-bit `--save` is broken), tuned for small/mid-size layers on Ada: coalesced and vectorized
+     loads, warp-shuffle reductions instead of `atomicAdd`, several rows per thread block, and possibly
+     group support and batch > 1. CUDA Graphs could remove per-token launch overhead in generation.
+   - Supporting work: GPU bit packing (minor, about 18 s per 6.7B model) and a shared benchmark suite
+     (perplexity, layer reconstruction error, quantization time, kernel latency with CUDA events, real
+     weight memory, end-to-end decode latency).
+5. **Scope risk:** the professor asked to *implement the GPTQ mechanism*. A project that only speeds up
+     inference might not satisfy a strict reading, so Track A should stay in scope.
 
 ## Open questions / next steps
 
 - Repeat the OPT-125M and OPT-1.3B runs on an actual CSIL machine to get real timings and check RAM and
   disk quota.
 - Profile the 125M generation path (Nsight Systems) to separate kernel time from Python/launch overhead.
+- Rerun `tools/profile_quant_time.py` on CSIL: with about 12 instead of about 44 FP32 TFLOPS, Hessian
+  accumulation should take a larger share there.
+- Confirm with the professor that optimizing quantized inference (Track B) counts alongside the quantization
+  algorithm (Track A).
 - Decide on the evaluation scope (perplexity only vs. also zero-shot tasks).
+
+## Cross-check against `chatgpt_suggestions.md`
+
+A separate ChatGPT analysis of the repo agrees with the feasibility verdict and proposes the same two
+tracks. Its points that this report adopted: the scope argument (running the repo isn't enough), the
+risk about the professor's wording, the simulated nature of the 4-bit path, CPU-side bit packing, and
+measuring with CUDA events and Nsight. Points where our measurements disagree:
+
+- It calls OPT-6.7B "risky for quantization on 16 GB". Measured peak: 9.16 GiB, with room for 2.25× the
+  calibration data. The tight case is FP16 *inference* with the whole model on the GPU (13.6 of 15.44 GiB).
+- It lists dependency compatibility as a main risk. That's resolved (about 25 lines, on `experiment_0`).
+- It targets only the column loop for quantization speedups. The profile shows that loop is at most
+  23–53% of quantization time, and Hessian accumulation is the larger share for bigger models.
+- It suggests GPU bit packing as a subproject. Packing takes about 18 s per 6.7B model, so the payoff is small.
+- It assumes a two-person team (we are three), and recommends OPT-350M, which we haven't tested.
+
+It did not catch the silent 4-bit `--save` corruption or the missing group support in the kernel.

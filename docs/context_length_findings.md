@@ -34,10 +34,19 @@ Peak VRAM vs prompt length at batch size 1: 12.73 GiB at 512 tokens, 13.03 GiB a
 Computing logits for every token (perplexity-style) instead of only the last one (generation-style) adds
 only about 0.02 GiB.
 
-In this mode memory really is tight. That is the case for quantization: 4-bit weights for 6.7B would take
-about 3.5 GiB instead of 12.4 GiB, leaving roughly 9 GiB more for the KV cache (about 18k more cached
-tokens). That figure is an **estimate, not measured**: the repo's 3-bit kernel only supports batch size 1,
-one token at a time, so it can't be tested with the code as it stands.
+In this mode memory really is tight, which is where real low-bit weights would help. Truly packed 4-bit weights
+for 6.7B would take about 3.5 GiB instead of 12.4 GiB, leaving roughly 9 GiB more for the KV cache (about 18k
+more cached tokens). That figure is an **arithmetic estimate, not a measurement**, and the repo can't deliver
+it as is:
+
+- The repo's 4-bit quantization is **simulated**: quantized values are written back as FP16 weights, so a
+  "4-bit" model uses exactly the same 12.4 GiB.
+- Only 3-bit has a packed format and kernel (about 2.7 GiB of weights for 6.7B, also estimated), and that
+  kernel handles one token at a time at batch size 1, so the batch rows above can't be tested with it.
+- `opt.py --wbits 4 --save` silently writes a corrupted checkpoint (4-bit values packed into 3-bit fields).
+
+Getting the memory savings needs a real INT4 packed format and kernel, which is one of our candidate CUDA
+project tracks (see `initial_experiment_discoveries.md`).
 
 ## 2. The GPTQ quantization pipeline (why VRAM looked mostly unused)
 
