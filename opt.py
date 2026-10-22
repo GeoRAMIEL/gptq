@@ -315,8 +315,6 @@ def benchmark(model, input_ids, check=False):
             if cache['past']:
                 cache['past'][i] = None
         return tmp
-    for i, layer in enumerate(model.model.decoder.layers):
-        layer.register_forward_hook(clear_past(i))
 
     print('Benchmarking ...')
 
@@ -345,7 +343,7 @@ def benchmark(model, input_ids, check=False):
             print(i, times[-1])
             if check and i != input_ids.numel() - 1:
                 tot += loss(out.logits[0].to(DEV), input_ids[:, (i + 1)].to(DEV)).float()
-            cache['past'] = list(out.past_key_values)
+            cache['past'] = out.past_key_values
             del out
         sync()
         import numpy as np

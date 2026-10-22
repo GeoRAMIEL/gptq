@@ -29,6 +29,7 @@ def llama_sequential(model, dataloader, dev):
     layers = model.model.layers
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    model.model.rotary_emb = model.model.rotary_emb.to(dev)
     model.model.norm = model.model.norm.to(dev)
     layers[0] = layers[0].to(dev)
 
@@ -47,6 +48,7 @@ def llama_sequential(model, dataloader, dev):
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
+            cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -64,6 +66,7 @@ def llama_sequential(model, dataloader, dev):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
     print('Ready.')
 
@@ -101,7 +104,7 @@ def llama_sequential(model, dataloader, dev):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
             for h in handles:
                 h.remove()
 
@@ -115,7 +118,7 @@ def llama_sequential(model, dataloader, dev):
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
 
         layers[i] = layer.cpu()
         del layer
@@ -140,6 +143,7 @@ def llama_eval(model, testenc, dev):
     layers = model.model.layers
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    model.model.rotary_emb = model.model.rotary_emb.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -157,6 +161,7 @@ def llama_eval(model, testenc, dev):
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
+            cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
     layers[0] = Catcher(layers[0])
     for i in range(nsamples):
@@ -174,6 +179,7 @@ def llama_eval(model, testenc, dev):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
     for i in range(len(layers)):
         print(i)
@@ -193,7 +199,7 @@ def llama_eval(model, testenc, dev):
                 ).to(next(iter(layer.parameters())).dtype)
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
