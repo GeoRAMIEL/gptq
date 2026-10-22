@@ -104,7 +104,11 @@ WikiText2 test set. Paper values are from Table 3.
 | OPT-125M | RTN 4-bit | 37.28 | 37.28 | 45.12 | 31.64 | – | 2.0 GiB |
 | OPT-125M | GPTQ 4-bit | 30.96 | 31.12 | 37.16 | 26.92 | 12 s | 2.0 GiB |
 | OPT-125M | GPTQ 3-bit | 54.53 | 53.85 | 71.83 | 38.99 | 12 s | 2.0 GiB |
+| OPT-1.3B | FP16 | 14.62 | 14.63 | 16.96 | 14.72 | – | – |
 | OPT-1.3B | GPTQ 4-bit | 15.67 | 15.47 | 18.27 | 15.55 | 95 s | 4.6 GiB |
+| OPT-1.3B | GPTQ 4-bit g128 | 14.81 | – | 17.41 | 15.06 | 96 s | – |
+| OPT-1.3B | GPTQ 3-bit | 20.87 | 20.97 | 25.48 | 19.76 | 95 s | – |
+| OPT-1.3B | GPTQ 3-bit g128 | 16.79 | – | 19.12 | 16.11 | 96 s | – |
 | OPT-6.7B | GPTQ 4-bit | 11.34 | 11.39 | 13.75 | 12.14 | 403 s | 9.2 GiB |
 
 All perplexities here are from simulated quantization: after GPTQ, each weight is replaced by its
@@ -222,6 +226,55 @@ Full details are in [`context_length_findings.md`](context_length_findings.md). 
 | `tools/calib_memory_sweep.py N` | GPTQ pipeline peak VRAM and time per layer for N calibration segments (first 2 layers) |
 | `tools/gptq_memory_phases.py N` | Per-phase VRAM breakdown of quantizing one layer |
 | `tools/profile_quant_time.py MODEL [--layers N]` | Wall-time breakdown of quantization (Hessian, column loop, Cholesky, forward passes) |
+
+### Why the repo has a 3-bit kernel only, and what 4-bit would gain
+
+**Why 3-bit.** The paper's speedup demo is OPT-175B on a *single* 80 GB A100. At 3 bits the model takes
+about 63 GB plus about 9 GB of KV cache for 2048 tokens, and the paper notes that "the model would not
+fully fit using 4 bits" (about 88 GB). 3-bit is also where GPTQ beats round-to-nearest by the most: at
+4-bit RTN is still usable for large models, while at 3-bit it collapses. So the choice served the 175B
+headline, and doesn't imply 4-bit is worse. Most later GPTQ tools standardized on 4-bit, usually with group
+size 128.
+
+**What 4-bit gains us:**
+
+1. **Accuracy at the sizes we can run.** Smaller models quantize worse (one of the paper's findings), and
+   3-bit degrades them heavily:
+
+   | WikiText2 PPL | FP16 | GPTQ 4-bit | GPTQ 4-bit g128 | GPTQ 3-bit | GPTQ 3-bit g128 |
+   |---|---|---|---|---|---|
+   | OPT-125M (ours) | 27.65 | 30.96 | – | 54.53 | – |
+   | OPT-1.3B (ours) | 14.62 | 15.67 | 14.81 | 20.87 | 16.79 |
+   | OPT-1.3B (paper) | 14.63 | 15.47 | – | 20.97 | – |
+   | OPT-2.7B (paper) | 12.47 | 12.87 | – | 16.88 | – |
+   | OPT-6.7B (paper / ours 4-bit) | 10.86 | 11.39 / 11.34 | – | 14.86 | – |
+
+   (Ours: C4 calibration, 128 × 2048 tokens, seed 0. "–" = not reported or not run.)
+
+   Our OPT-1.3B 3-bit result (20.87) matches the paper (20.97). At 1.3B, plain 3-bit loses 6.25 PPL versus
+   FP16 and plain 4-bit loses 1.05. **4-bit g128 is within 0.19 of FP16.** Grouping helps 3-bit a lot
+   (20.87 → 16.79) but still leaves it 2.2 PPL behind FP16, and worse than ungrouped 4-bit. At these
+   model sizes, 4-bit g128 is the setting that keeps near-FP16 quality.
+
+2. **A simpler, more optimizable kernel.** 4 bits divide 32 evenly: 8 weights per 32-bit word and none
+   spans two words, so unpacking is plain shifts and masks. One 128-bit load gets exactly 32 weights, and
+   a group of 128 is exactly 16 words. 3-bit packs 32 weights into 3 words with values split across word
+   boundaries (the `(tmp1 >> 30) | ((tmp2 << 2) & 0x4)` code in `quant_cuda_kernel.cu`), which makes
+   vectorized loads, group support and tiling awkward. With 4-bit, the effort goes into the course's
+   CUDA topics (coalescing, vectorized loads, warp reductions, tiling, and later tensor cores for batch > 1)
+   rather than bit puzzles.
+3. **Group support fits naturally.** g128 is the standard accuracy-recovery setting; the current 3-bit
+   kernel has no group support at all.
+4. **Comparable results.** 4-bit (often g128) is the common format in later GPTQ tools.
+
+**What it costs:** 33% more weight bytes than 3-bit, so the best possible matvec speedup over FP16 is
+4× instead of 5.33×, if bandwidth is the limit. Small models currently look overhead-bound, so that
+ceiling may not bind. Capacity isn't a deciding factor at our scale: OPT-6.7B weights would be about
+3.4 GiB at 4-bit vs about 2.7 GiB at 3-bit (estimates), and both fit easily.
+
+**Decision proposal:** make 4-bit with group size 128 the main inference format for Track B, with the repo's
+3-bit kernel as a baseline to compare against. A new 4-bit packer also removes the `--wbits 4 --save`
+corruption.
 
 ## Conclusions
 
