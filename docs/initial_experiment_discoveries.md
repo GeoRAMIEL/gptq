@@ -135,6 +135,28 @@ speedups on huge matrices, but it **loses to FP16 at OPT-125M's 768/3072-wide la
 kernel launch overhead, `atomicAdd` reduction, the fixed 24×256 tiling and Python per-layer overhead
 dominate, not memory bandwidth.
 
+### Memory limits: context length and calibration size (OPT-6.7B)
+
+Full details are in [`context_length_findings.md`](context_length_findings.md). Scripts are in `tools/`.
+
+- **Context length is capped at 2048 by the model** (learned position embeddings), not by VRAM, and 2048
+  fits: FP16 OPT-6.7B fully on the GPU, batch 1, 2048-token prompt peaks at 13.6 of 15.44 GiB usable.
+- **Whole model on the GPU (inference):** weights take 12.40 GiB and the KV cache 0.5 MiB/token, which leaves
+  room for about 3,600–3,700 cached tokens in total (batch 2 → 1856 tokens each, batch 4 → 896, batch 8 → 448).
+  4-bit weights would free about 9 GiB for the KV cache (estimated; the repo's kernel can't be tested beyond
+  batch 1).
+- **GPTQ pipeline:** peak ≈ 5.16 GiB + nsamples/32 GiB, so the maximum is about **288 calibration segments**
+  (590k tokens, 2.25× the paper's 128). It runs out of memory at 304. The peak always occurs while quantizing
+  `fc2`: its 1 GiB FP32 Hessian goes through Cholesky → inverse → Cholesky (about 3.75 GiB of temporaries).
+- Measure one configuration per process. Sweeping sizes in one process gave false out-of-memory errors
+  from memory left over between runs.
+
+| Tool | Measures |
+|---|---|
+| `tools/fp16_context_memory.py` | FP16 full-GPU peak VRAM vs prompt length and batch size; longest prompt that fits per batch size |
+| `tools/calib_memory_sweep.py N` | GPTQ pipeline peak VRAM and time per layer for N calibration segments (first 2 layers) |
+| `tools/gptq_memory_phases.py N` | Per-phase VRAM breakdown of quantizing one layer |
+
 ## Conclusions
 
 1. **Feasible on CSIL hardware.** The full GPTQ pipeline (calibration → quantization → perplexity eval)
